@@ -1,204 +1,196 @@
+import sys
 import time
+import logging
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+import torch
 from ultralytics import YOLO
+
 from arduino_controller import ArduinoController, ArduinoConfig, find_arduino_port
 
-try:
-    import torch
-except Exception:  # pragma: no cover - torch is expected through ultralytics
-    torch = None
+CONFIG = {
+    "model_path": "./model.pt",
+    "conf_threshold": 0.70, 
+    "img_size": 640,
+    "class_pallet": "pallet",
+    "class_box": "box",
+    "camera_indices": (0, 1),
+    "camera_width": 1280,
+    "camera_height": 720,
+    "local_iou_threshold": 0.25,
+    "track_ttl_seconds": 1.5,
+    "min_confirmations_to_count": 2,
+    "match_x_threshold": 0.12,
+    "match_y_threshold": 0.14,
+    "match_area_ratio_threshold": 1.5,
+    "match_aspect_ratio_threshold": 1.4,
+    "panel_width": 960,
+    "panel_height": 1080,
+    "window_name": "Batch Validator",
+    "bg_color": (30, 30, 30),
+}
 
+def setup_logger(name: str = "batch_validator") -> logging.Logger:
+    logger = logging.getLogger(name)
 
-MODEL_PATH = "./model.pt"
-CAMERA_INDICES = (0, 1)
-CONF_THRESHOLD = 0.8
-IMG_SIZE = 640
-WINDOW_NAME = "Batch Validator"
-FRAME_PLACEHOLDER = (30, 30, 30)
-FUSION_CENTER_THRESHOLD = 0.18
-FUSION_AREA_RATIO_THRESHOLD = 1.8
-LOCAL_IOU_THRESHOLD = 0.25
-TRACK_TTL_SECONDS = 1.5
-MIN_CONFIRMATIONS_TO_COUNT = 2
-MATCH_Y_THRESHOLD = 0.14
-MATCH_X_THRESHOLD = 0.12
-MATCH_AREA_RATIO_THRESHOLD = 1.5
-MATCH_ASPECT_RATIO_THRESHOLD = 1.4
+    if logger.handlers:
+        logger.handlers.clear()
 
+    logger.setLevel(logging.DEBUG)
+
+    fmt = logging.Formatter(
+        "[%(asctime)s] %(levelname)-8s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
+
+    return logger
+
+log = setup_logger()
 
 def select_device() -> str:
-    if torch is None:
-        return "cpu"
-
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        log.info("Device: Apple MPS (M1)")
         return "mps"
-
+    
     if torch.cuda.is_available():
-        return "cuda"
+        name = torch.cuda.get_device_name(0)
 
+        log.info(f"Device: CUDA — {name}")
+        return "cuda"
+    
+    log.info("Device: CPU")
     return "cpu"
 
 
-DEVICE = select_device()
-MODEL = YOLO(MODEL_PATH)
-if DEVICE != "cpu":
-    MODEL.to(DEVICE)
+BBox = Tuple[int, int, int, int] # (x1, y1, x2, y2)
 
+def box_iou(a: BBox, b: BBox) -> float:
+    ix1 = max(a[0], b[0]);  iy1 = max(a[1], b[1])
+    ix2 = min(a[2], b[2]);  iy2 = min(a[3], b[3])
 
-def box_iou(box_a: Tuple[int, int, int, int], box_b: Tuple[int, int, int, int]) -> float:
-    ax1, ay1, ax2, ay2 = box_a
-    bx1, by1, bx2, by2 = box_b
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
 
-    inter_x1 = max(ax1, bx1)
-    inter_y1 = max(ay1, by1)
-    inter_x2 = min(ax2, bx2)
-    inter_y2 = min(ay2, by2)
-
-    inter_w = max(0, inter_x2 - inter_x1)
-    inter_h = max(0, inter_y2 - inter_y1)
-    inter_area = inter_w * inter_h
-
-    if inter_area == 0:
+    if inter == 0:
         return 0.0
+    
+    area_a = max(1, (a[2] - a[0]) * (a[3] - a[1]))
+    area_b = max(1, (b[2] - b[0]) * (b[3] - b[1]))
 
-    area_a = max(1, (ax2 - ax1) * (ay2 - ay1))
-    area_b = max(1, (bx2 - bx1) * (by2 - by1))
-    return inter_area / float(area_a + area_b - inter_area)
-
-
-def center_and_area(box: Tuple[int, int, int, int]) -> Tuple[Tuple[float, float], float, float]:
-    x1, y1, x2, y2 = box
-    width = max(1, x2 - x1)
-    height = max(1, y2 - y1)
-    center = (x1 + width / 2.0, y1 + height / 2.0)
-    aspect_ratio = width / float(height)
-    return center, float(width * height), float(aspect_ratio)
+    return inter / float(area_a + area_b - inter)
 
 
-def normalize_box(box: Tuple[int, int, int, int], frame_size: Tuple[int, int]) -> Tuple[Tuple[float, float], float, float]:
-    frame_width, frame_height = frame_size
-    center, area, aspect_ratio = center_and_area(box)
-    normalized_center = (center[0] / max(1, frame_width), center[1] / max(1, frame_height))
-    normalized_area = area / float(max(1, frame_width * frame_height))
-    return normalized_center, normalized_area, aspect_ratio
+def normalize_box(bbox: BBox, frame_w: int, frame_h: int):
+    x1, y1, x2, y2 = bbox
+
+    w = max(1, x2 - x1);  h = max(1, y2 - y1)
+
+    cx = (x1 + w / 2.0) / max(1, frame_w)
+    cy = (y1 + h / 2.0) / max(1, frame_h)
+
+    area = (w * h) / max(1, frame_w * frame_h)
+
+    return (cx, cy), area, w / float(h)
 
 
-def fit_frame(frame: np.ndarray, target_size: Tuple[int, int]) -> np.ndarray:
-    target_width, target_height = target_size
-    if frame is None:
-        return np.full((target_height, target_width, 3), FRAME_PLACEHOLDER, dtype=np.uint8)
-
-    source_height, source_width = frame.shape[:2]
-    scale = min(target_width / float(max(1, source_width)), target_height / float(max(1, source_height)))
-    resized_width = max(1, int(source_width * scale))
-    resized_height = max(1, int(source_height * scale))
-    resized = cv2.resize(frame, (resized_width, resized_height))
-
-    canvas = np.full((target_height, target_width, 3), FRAME_PLACEHOLDER, dtype=np.uint8)
-    x_offset = (target_width - resized_width) // 2
-    y_offset = (target_height - resized_height) // 2
-    canvas[y_offset:y_offset + resized_height, x_offset:x_offset + resized_width] = resized
-    return canvas
+def boxes_overlap(box_bbox: BBox, pallet_bbox: BBox) -> bool:
+    return box_iou(box_bbox, pallet_bbox) > 0.0
 
 
 class CameraStream:
-    def __init__(self, index: int):
+    def __init__(self, index: int, width: int, height: int):
         self.index = index
-        self.capture = cv2.VideoCapture(index)
-        self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        self.capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        self.running = self.capture.isOpened()
-        self.lock = threading.Lock()
-        self.frame = None
-        self.success = False
-        self.thread = threading.Thread(target=self._reader, daemon=True)
-        self.thread.start()
+        self.cap = cv2.VideoCapture(index)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.running = self.cap.isOpened()
+        self._lock = threading.Lock()
+        self._frame = None
+        self._ok = False
+        self._thread = threading.Thread(target = self._reader, daemon = True)
+
+        self._thread.start()
 
     def _reader(self) -> None:
         while self.running:
-            success, frame = self.capture.read()
-            with self.lock:
-                self.success = success
-                if success:
-                    self.frame = frame
-            if not success:
+            ok, frame = self.cap.read()
+            with self._lock:
+                self._ok = ok
+                self._frame = frame if ok else self._frame
+            if not ok:
                 time.sleep(0.01)
 
     def read(self) -> Tuple[bool, Optional[np.ndarray]]:
-        with self.lock:
-            if not self.success or self.frame is None:
+        with self._lock:
+            if not self._ok or self._frame is None:
                 return False, None
-            return True, self.frame.copy()
+            
+            return True, self._frame.copy()
 
     def release(self) -> None:
         self.running = False
-        if self.thread.is_alive():
-            self.thread.join(timeout=1.0)
-        self.capture.release()
+        self._thread.join(timeout=1.0)
 
+        self.cap.release()
 
 @dataclass
 class LocalTrack:
     track_id: int
-    bbox: Tuple[int, int, int, int]
+    bbox: BBox
     conf: float
     last_seen: float
     hits: int = 1
 
 
 class SimpleTracker:
-    def __init__(self, camera_name: str):
-        self.camera_name = camera_name
-        self.next_track_id = 1
+    def __init__(self, name: str, iou_threshold: float, ttl: float):
+        self.name = name
+        self.iou_threshold = iou_threshold
+        self.ttl = ttl
+        self._next_id = 1
         self.tracks: Dict[int, LocalTrack] = {}
 
-    def update(self, detections: List[Tuple[Tuple[int, int, int, int], float]], now: float) -> List[LocalTrack]:
-        matched_tracks = set()
-        matched_detections = set()
-        track_ids = list(self.tracks.keys())
-
+    def update(self, detections: List[Tuple[BBox, float]], now: float) -> List[LocalTrack]:
         candidates = []
-        for track_id in track_ids:
-            track = self.tracks[track_id]
-            for detection_index, (bbox, confidence) in enumerate(detections):
-                iou_score = box_iou(track.bbox, bbox)
-                if iou_score < LOCAL_IOU_THRESHOLD:
-                    continue
-                candidates.append((iou_score, track_id, detection_index, bbox, confidence))
 
-        candidates.sort(reverse=True, key=lambda item: item[0])
+        for tid, track in self.tracks.items():
+            for di, (bbox, conf) in enumerate(detections):
+                iou = box_iou(track.bbox, bbox)
+                if iou >= self.iou_threshold:
+                    candidates.append((iou, tid, di, bbox, conf))
 
-        for _, track_id, detection_index, bbox, confidence in candidates:
-            if track_id in matched_tracks or detection_index in matched_detections:
+        candidates.sort(reverse=True, key=lambda x: x[0])
+
+        matched_t, matched_d = set(), set()
+        for _, tid, di, bbox, conf in candidates:
+            if tid in matched_t or di in matched_d:
                 continue
-            self.tracks[track_id].bbox = bbox
-            self.tracks[track_id].conf = confidence
-            self.tracks[track_id].last_seen = now
-            self.tracks[track_id].hits += 1
-            matched_tracks.add(track_id)
-            matched_detections.add(detection_index)
 
-        for detection_index, (bbox, confidence) in enumerate(detections):
-            if detection_index in matched_detections:
+            self.tracks[tid].bbox = bbox
+            self.tracks[tid].conf = conf
+            self.tracks[tid].last_seen = now
+            self.tracks[tid].hits += 1
+
+            matched_t.add(tid); matched_d.add(di)
+
+        for di, (bbox, conf) in enumerate(detections):
+            if di in matched_d:
                 continue
-            track_id = self.next_track_id
-            self.next_track_id += 1
-            self.tracks[track_id] = LocalTrack(
-                track_id=track_id,
-                bbox=bbox,
-                conf=confidence,
-                last_seen=now,
-            )
 
-        stale_ids = [track_id for track_id, track in self.tracks.items() if now - track.last_seen > TRACK_TTL_SECONDS]
-        for track_id in stale_ids:
-            del self.tracks[track_id]
+            tid = self._next_id;  self._next_id += 1
+            self.tracks[tid] = LocalTrack(tid, bbox, conf, now)
+
+        for tid in [t for t, tr in self.tracks.items() if now - tr.last_seen > self.ttl]:
+            del self.tracks[tid]
 
         return list(self.tracks.values())
 
@@ -207,357 +199,393 @@ class SimpleTracker:
 class GlobalObject:
     global_id: int
     camera_name: str
-    local_track_id: int
-    bbox: Tuple[int, int, int, int]
+    local_id: int
+    bbox: BBox
     conf: float
-    frame_size: Tuple[int, int]
+    frame_w: int
+    frame_h: int
     last_seen: float
-    observations_seen: int = 0
-    seen_cameras: set[str] = None
+    observations: int = 0
+    seen_cameras: set = field(default_factory = set)
     counted: bool = False
-
-    def __post_init__(self) -> None:
-        if self.seen_cameras is None:
-            self.seen_cameras = {self.camera_name}
 
 
 class GlobalFusionCounter:
-    def __init__(self):
-        self.next_global_id = 1
-        self.global_objects: Dict[int, GlobalObject] = {}
-        self.local_to_global: Dict[Tuple[str, int], int] = {}
+    def __init__(self, cfg: dict):
+        self.min_confirmations = cfg["min_confirmations_to_count"]
+        self.ttl = cfg["track_ttl_seconds"]
+        self.match_x = cfg["match_x_threshold"]
+        self.match_y = cfg["match_y_threshold"]
+        self.match_area = cfg["match_area_ratio_threshold"]
+        self.match_aspect = cfg["match_aspect_ratio_threshold"]
+        self._next_id = 1
+        self.objects: Dict[int, GlobalObject] = {}
+        self._local_to_global: Dict[Tuple[str, int], int] = {}
         self.total_count = 0
 
-    def _match_existing(self, camera_name: str, local_track_id: int, bbox: Tuple[int, int, int, int], frame_size: Tuple[int, int], now: float) -> Optional[int]:
-        direct_key = (camera_name, local_track_id)
-        if direct_key in self.local_to_global:
-            global_id = self.local_to_global[direct_key]
-            if global_id in self.global_objects:
-                return global_id
+    def _find_match(self, cam: str, lid: int, bbox: BBox, fw: int, fh: int, now: float) -> Optional[int]:
+        key = (cam, lid)
 
-        normalized_center, normalized_area, normalized_aspect = normalize_box(bbox, frame_size)
-        best_global_id = None
-        best_score = float("inf")
+        if key in self._local_to_global:
+            gid = self._local_to_global[key]
 
-        for global_id, global_object in self.global_objects.items():
-            if now - global_object.last_seen > TRACK_TTL_SECONDS * 2:
+            if gid in self.objects:
+                return gid
+
+        (cx, cy), area, aspect = normalize_box(bbox, fw, fh)
+        best_gid, best_score = None, float("inf")
+
+        for gid, obj in self.objects.items():
+            if now - obj.last_seen > self.ttl * 2:
                 continue
 
-            if global_object.camera_name == camera_name and global_object.local_track_id == local_track_id:
-                return global_id
+            (ex, ey), earea, easpect = normalize_box(obj.bbox, obj.frame_w, obj.frame_h)
 
-            existing_center, existing_area, existing_aspect = normalize_box(global_object.bbox, global_object.frame_size)
-            center_x_distance = abs(normalized_center[0] - existing_center[0])
-            center_y_distance = abs(normalized_center[1] - existing_center[1])
-            area_ratio = max(normalized_area, existing_area) / max(1e-6, min(normalized_area, existing_area))
-            aspect_ratio = max(normalized_aspect, existing_aspect) / max(1e-6, min(normalized_aspect, existing_aspect))
-
-            if center_x_distance > MATCH_X_THRESHOLD:
-                continue
-            if center_y_distance > MATCH_Y_THRESHOLD:
-                continue
-            if area_ratio > MATCH_AREA_RATIO_THRESHOLD:
-                continue
-            if aspect_ratio > MATCH_ASPECT_RATIO_THRESHOLD:
+            if abs(cx - ex) > self.match_x:
                 continue
 
-            score = (center_x_distance * 0.25) + (center_y_distance * 0.75) + (area_ratio - 1.0) + ((aspect_ratio - 1.0) * 0.5)
+            if abs(cy - ey) > self.match_y:
+                continue
+
+            area_r   = max(area, earea)   / max(1e-9, min(area, earea))
+            aspect_r = max(aspect, easpect) / max(1e-9, min(aspect, easpect))
+
+            if area_r > self.match_area: continue
+            if aspect_r > self.match_aspect: continue
+
+            score = abs(cx - ex) * 0.25 + abs(cy - ey) * 0.75 + (area_r - 1) + (aspect_r - 1) * 0.5
             if score < best_score:
-                best_score = score
-                best_global_id = global_id
+                best_score = score; best_gid = gid
 
-        return best_global_id
+        return best_gid
 
-    def update(self, observations: List[Dict[str, object]], now: float) -> Dict[int, int]:
-        assigned: Dict[int, int] = {}
-        used_global_ids = set()
+    def update(self, observations: List[dict], now: float) -> None:
+        used = set()
 
-        ordered_observations = sorted(
-            observations,
-            key=lambda item: float(item["conf"]),
-            reverse=True,
-        )
+        for obs in sorted(observations, key=lambda o: o["conf"], reverse=True):
+            cam = obs["camera_name"]
+            lid = obs["local_id"]
+            bbox = obs["bbox"]
+            fw, fh = obs["frame_w"], obs["frame_h"]
+            conf = obs["conf"]
 
-        for observation in ordered_observations:
-            camera_name = str(observation["camera_name"])
-            local_track_id = int(observation["local_track_id"])
-            bbox = observation["bbox"]
-            frame_size = observation["frame_size"]
-            confidence = float(observation["conf"])
+            gid = self._find_match(cam, lid, bbox, fw, fh, now)
+            if gid in used:
+                gid = None
 
-            matched_global_id = self._match_existing(camera_name, local_track_id, bbox, frame_size, now)
-            if matched_global_id in used_global_ids:
-                matched_global_id = None
-
-            if matched_global_id is None:
-                matched_global_id = self.next_global_id
-                self.next_global_id += 1
-                self.global_objects[matched_global_id] = GlobalObject(
-                    global_id=matched_global_id,
-                    camera_name=camera_name,
-                    local_track_id=local_track_id,
-                    bbox=bbox,
-                    conf=confidence,
-                    frame_size=frame_size,
-                    last_seen=now,
+            if gid is None:
+                gid = self._next_id;  self._next_id += 1
+                
+                self.objects[gid] = GlobalObject(
+                    global_id=gid, camera_name=cam, local_id=lid,
+                    bbox=bbox, conf=conf, frame_w=fw, frame_h=fh, last_seen=now,
                 )
             else:
-                global_object = self.global_objects[matched_global_id]
-                global_object.camera_name = camera_name
-                global_object.local_track_id = local_track_id
-                global_object.bbox = bbox
-                global_object.conf = confidence
-                global_object.frame_size = frame_size
-                global_object.last_seen = now
-            global_object = self.global_objects[matched_global_id]
-            global_object.observations_seen += 1
-            global_object.seen_cameras.add(camera_name)
-            used_global_ids.add(matched_global_id)
+                obj = self.objects[gid]
+                obj.camera_name = cam; obj.local_id = lid
+                obj.bbox = bbox; obj.conf = conf
+                obj.frame_w = fw; obj.frame_h = fh
+                obj.last_seen = now
 
-            if not global_object.counted and len(global_object.seen_cameras) >= MIN_CONFIRMATIONS_TO_COUNT and global_object.observations_seen >= MIN_CONFIRMATIONS_TO_COUNT:
-                global_object.counted = True
+            obj = self.objects[gid]
+            obj.observations += 1
+
+            obj.seen_cameras.add(cam)
+            used.add(gid)
+
+            if (not obj.counted
+                    and obj.observations >= self.min_confirmations
+                    and len(obj.seen_cameras) >= self.min_confirmations):
+                obj.counted = True
                 self.total_count += 1
+                log.info(f"New box counted (global_id={gid}) — total={self.total_count}")
 
-            self.local_to_global[(camera_name, local_track_id)] = matched_global_id
-            assigned[local_track_id] = matched_global_id
+            self._local_to_global[(cam, lid)] = gid
 
-        stale_global_ids = [
-            global_id
-            for global_id, global_object in self.global_objects.items()
-            if now - global_object.last_seen > TRACK_TTL_SECONDS * 4
-        ]
-        for global_id in stale_global_ids:
-            del self.global_objects[global_id]
+        stale = [gid for gid, obj in self.objects.items() if now - obj.last_seen > self.ttl * 4]
+        for gid in stale:
+            del self.objects[gid]
 
-        stale_local_keys = [
-            key
-            for key, global_id in self.local_to_global.items()
-            if global_id not in self.global_objects
-        ]
-        for key in stale_local_keys:
-            del self.local_to_global[key]
+        for key in [k for k, v in self._local_to_global.items() if v not in self.objects]:
+            del self._local_to_global[key]
 
-        return assigned
+    def reset(self) -> None:
+        self.objects.clear()
+        self._local_to_global.clear()
+        self.total_count = 0
+        self._next_id    = 1
 
-
-def infer_detections(frame: np.ndarray) -> List[Tuple[Tuple[int, int, int, int], float]]:
-    results = MODEL.predict(
-        source=frame,
-        conf=CONF_THRESHOLD,
-        imgsz=IMG_SIZE,
-        device=DEVICE,
-        half=False,
-        verbose=False,
+def run_inference(model: YOLO, frame: np.ndarray, device: str, cfg: dict) -> Tuple[List[Tuple[BBox, float]], List[BBox]]:
+    results = model.predict(
+        source = frame,
+        conf = cfg["conf_threshold"],
+        imgsz = cfg["img_size"],
+        device = device,
+        half = False,
+        verbose = False,
     )
 
-    detections: List[Tuple[Tuple[int, int, int, int], float]] = []
-    if not results:
-        return detections
+    pallet_boxes: List[BBox] = []
+    raw_boxes: List[Tuple[BBox, float]] = []
+
+    if not results or results[0].boxes is None:
+        return [], []
 
     result = results[0]
-    if result.boxes is None:
-        return detections
+    names  = result.names
 
-    for detection in result.boxes:
-        x1, y1, x2, y2 = map(int, detection.xyxy[0])
-        confidence = float(detection.conf[0])
-        detections.append(((x1, y1, x2, y2), confidence))
+    for det in result.boxes:
+        cls_name = names[int(det.cls[0])]
+        bbox     = tuple(map(int, det.xyxy[0]))
+        conf     = float(det.conf[0])
 
-    return detections
+        if cls_name == cfg["class_pallet"]:
+            pallet_boxes.append(bbox)
+        elif cls_name == cfg["class_box"]:
+            raw_boxes.append((bbox, conf))
 
+    if not pallet_boxes:
+        return [], []
 
-def draw_detections(frame: np.ndarray, tracks: List[LocalTrack], camera_label: str) -> np.ndarray:
-    annotated = frame.copy()
-    for track in tracks:
-        x1, y1, x2, y2 = track.bbox
-        color = (0, 255, 0) if track.conf >= CONF_THRESHOLD else (0, 255, 255)
-        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(
-            annotated,
-            f"{camera_label} ID {track.track_id} {track.conf:.0%}",
-            (x1, max(20, y1 - 10)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            color,
-            2,
-        )
-    return annotated
+    box_detections = [
+        (bbox, conf)
+        for bbox, conf in raw_boxes
+        if any(boxes_overlap(bbox, p) for p in pallet_boxes)
+    ]
+
+    return box_detections, pallet_boxes
 
 
-def print_status(total_count: int, expected_qty: Optional[int], arduino: Optional[ArduinoController] = None) -> None:
-    if expected_qty is None:
-        print(f"[count] total={total_count} expected=unset status=awaiting input")
-        return
+def draw_frame(frame: np.ndarray, box_tracks: List[LocalTrack], pallet_boxes: List[BBox], cam_label: str, cfg: dict) -> np.ndarray:
+    out = frame.copy()
 
-    status = "MATCH" if total_count == expected_qty else "NOT MATCH"
-    print(f"[count] total={total_count} expected={expected_qty} status={status}")
+    for p in pallet_boxes:
+        cv2.rectangle(out, (p[0], p[1]), (p[2], p[3]), (200, 120, 0), 2)
+        cv2.putText(out, "pallet", (p[0], max(16, p[1] - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 120, 0), 2)
+
+    for t in box_tracks:
+        x1, y1, x2, y2 = t.bbox
+        color = (0, 255, 0) if t.conf >= cfg["conf_threshold"] else (0, 220, 220)
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(out, f"{cam_label} #{t.track_id}  {t.conf:.0%}",
+                    (x1, max(20, y1 - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        
+    return out
+
+
+def fit_frame(frame: Optional[np.ndarray], w: int, h: int, bg: tuple) -> np.ndarray:
+    canvas = np.full((h, w, 3), bg, dtype=np.uint8)
+
+    if frame is None:
+        return canvas
     
-    # Send command to Arduino
-    if arduino and arduino.connected:
-        if total_count == expected_qty:
-            print("→ Arduino: Opening gate (GREEN LED)")
-            arduino.open_gate()
-        else:
-            print("→ Arduino: Closing gate (RED LED)")
-            arduino.close_gate()
+    sh, sw = frame.shape[:2]
+    scale  = min(w / max(1, sw), h / max(1, sh))
+    rw, rh = max(1, int(sw * scale)), max(1, int(sh * scale))
+    resized = cv2.resize(frame, (rw, rh))
+    ox, oy  = (w - rw) // 2, (h - rh) // 2
+    canvas[oy:oy + rh, ox:ox + rw] = resized
 
+    return canvas
+
+
+def draw_hud(canvas: np.ndarray, fps: float, total: int,
+             expected: Optional[int], typing_buf: str,
+             arduino_ok: bool) -> None:
+    cv2.rectangle(canvas, (0, 0), (canvas.shape[1], 110), (0, 0, 0), -1)
+
+    if expected is None:
+        status_text  = "Awaiting expected qty"
+        status_color = (200, 200, 200)
+    elif total == expected:
+        status_text  = "MATCH"
+        status_color = (0, 220, 0)
+    else:
+        status_text  = "NOT MATCH"
+        status_color = (0, 0, 255)
+
+    ard_color = (0, 255, 0) if arduino_ok else (80, 80, 255)
+    ard_label = "Arduino: CONNECTED" if arduino_ok else "Arduino: OFFLINE"
+
+    cv2.putText(canvas, f"FPS: {fps:.1f}", (20,  40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+    cv2.putText(canvas, f"Boxes: {total}", (20,  80), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0),     2)
+    cv2.putText(canvas, f"Expected: {expected or '—'}", (400, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+    cv2.putText(canvas, f"Status: {status_text}", (400, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.9, status_color,    2)
+    cv2.putText(canvas, ard_label, (900, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, ard_color,       2)
+    cv2.putText(canvas, f"Input: {typing_buf or '_'} [digits+Enter | Backspace | r=reset | q=quit]", (900, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+
+
+def handle_arduino(arduino: Optional[ArduinoController], total: int, expected: Optional[int]) -> None:
+    if arduino is None or not arduino.connected:
+        return
+    
+    if expected is None:
+        arduino.idle()
+    elif total == expected:
+        arduino.open_gate()
+    else:
+        arduino.close_gate()
 
 def main() -> None:
-    # Initialize Arduino
-    print("Initializing Arduino connection...")
-    arduino_port = find_arduino_port()
-    arduino = None
-    arduino_status = "NOT CONNECTED"
-    
-    if arduino_port:
-        print(f"  Found Arduino port: {arduino_port}")
-        config = ArduinoConfig(port=arduino_port)
-        arduino = ArduinoController(config, debug=True)
-        if arduino.connected:
-            arduino_status = "CONNECTED"
+    log.info("=" * 60)
+    log.info("  Batch Validator — starting up")
+    log.info("=" * 60)
+
+    device = select_device()
+    log.info(f"Loading model: {CONFIG['model_path']}")
+    model = YOLO(CONFIG["model_path"])
+    if device != "cpu":
+        model.to(device)
+
+    arduino: Optional[ArduinoController] = None
+    port = find_arduino_port()
+    if port:
+        arduino = ArduinoController(ArduinoConfig(port=port))
     else:
-        print("  ⚠ Arduino port not auto-detected. Trying common ports...")
-        for port in ["/dev/cu.usbserial-A5069RR4", "/dev/tty.usbserial-A5069RR4",
-                     "/dev/cu.usbserial", "/dev/tty.usbserial",
-                     "/dev/cu.usbmodem14201", "/dev/tty.usbmodem14201", 
-                     "/dev/ttyUSB0"]:
-            try:
-                config = ArduinoConfig(port=port)
-                arduino = ArduinoController(config, debug=False)
-                if arduino.connected:
-                    arduino_status = "CONNECTED"
-                    print(f"  ✓ Connected on {port}")
-                    break
-            except:
-                pass
-    
-    if not arduino or not arduino.connected:
-        print("  ⚠ Arduino not available - running in camera-only mode")
-        arduino = None
-    
-    cameras = [CameraStream(index) for index in CAMERA_INDICES]
-    if not all(camera.running for camera in cameras):
-        print("Unable to open both cameras. Check the USB webcam indices.")
-        for camera in cameras:
-            camera.release()
-        if arduino:
-            arduino.disconnect()
+        log.warning("Arduino not found — continuing without hardware.")
+
+    cameras = [
+        CameraStream(idx, CONFIG["camera_width"], CONFIG["camera_height"])
+        for idx in CONFIG["camera_indices"]
+    ]
+
+    if not all(cam.running for cam in cameras):
+        log.error("Could not open both cameras. Check USB connections and indices.")
+        for cam in cameras: cam.release()
+
+        if arduino: arduino.disconnect()
         return
 
-    trackers = [SimpleTracker(f"cam{index}") for index in range(len(cameras))]
-    fusion_counter = GlobalFusionCounter()
+    trackers = [
+        SimpleTracker(
+            name = f"cam{i}",
+            iou_threshold = CONFIG["local_iou_threshold"],
+            ttl = CONFIG["track_ttl_seconds"],
+        )
 
-    expected_input = ""
+        for i in range(len(cameras))
+    ]
+
+    fusion = GlobalFusionCounter(CONFIG)
     expected_qty: Optional[int] = None
-    last_status: Optional[Tuple[int, Optional[int]]] = None
-    last_frame_time = time.time()
+    typing_buf = ""
+    last_status = None
+    last_t = time.time()
 
-    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    cv2.namedWindow(CONFIG["window_name"], cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty(CONFIG["window_name"], cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+
+    log.info("Running. Press 'q' to quit.")
 
     try:
         while True:
             now = time.time()
-            fps = 1.0 / max(1e-6, now - last_frame_time)
-            last_frame_time = now
+            fps = 1.0 / max(1e-9, now - last_t);  last_t = now
 
-            display_frames = []
-            combined_observations = []
+            panels = []
+            observations = []
 
-            for camera_index, camera in enumerate(cameras):
-                success, frame = camera.read()
-                if not success or frame is None:
-                    placeholder = np.full((720, 1280, 3), FRAME_PLACEHOLDER, dtype=np.uint8)
-                    cv2.putText(
-                        placeholder,
-                        f"Camera {camera_index + 1} offline",
-                        (40, 80),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        1.0,
-                        (0, 0, 255),
-                        2,
+            for i, cam in enumerate(cameras):
+                ok, frame = cam.read()
+
+                if not ok or frame is None:
+                    placeholder = np.full(
+                        (CONFIG["camera_height"], CONFIG["camera_width"], 3),
+                        CONFIG["bg_color"], dtype=np.uint8,
                     )
-                    display_frames.append(placeholder)
+
+                    cv2.putText(placeholder, f"Camera {i+1} offline", (40, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+                    panels.append(placeholder)
+
                     continue
 
-                detections = infer_detections(frame)
-                local_tracks = trackers[camera_index].update(detections, now)
-                combined_observations.extend(
-                    {
-                        "camera_name": trackers[camera_index].camera_name,
-                        "local_track_id": track.track_id,
-                        "bbox": track.bbox,
-                        "conf": track.conf,
-                        "frame_size": (frame.shape[1], frame.shape[0]),
-                    }
-                    for track in local_tracks
-                )
+                box_dets, pallet_boxes = run_inference(model, frame, device, CONFIG)
+                tracks = trackers[i].update(box_dets, now)
 
-                annotated = draw_detections(frame, local_tracks, f"Cam {camera_index + 1}")
-                camera_overlay = annotated.copy()
-                cv2.rectangle(camera_overlay, (0, 0), (430, 90), (0, 0, 0), -1)
-                cv2.putText(camera_overlay, f"Cam {camera_index + 1}", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
-                cv2.putText(camera_overlay, f"Local tracks: {len(local_tracks)}", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                display_frames.append(camera_overlay)
+                observations.extend({
+                    "camera_name": trackers[i].name,
+                    "local_id": t.track_id,
+                    "bbox": t.bbox,
+                    "conf": t.conf,
+                    "frame_w": frame.shape[1],
+                    "frame_h": frame.shape[0],
+                } for t in tracks)
 
-            fusion_counter.update(combined_observations, now)
-            total_count = fusion_counter.total_count
+                annotated = draw_frame(frame, tracks, pallet_boxes, f"Cam {i+1}", CONFIG)
 
-            if last_status != (total_count, expected_qty):
-                print_status(total_count, expected_qty, arduino)
-                last_status = (total_count, expected_qty)
+                cv2.rectangle(annotated, (0, 0), (380, 80), (0, 0, 0), -1)
+                cv2.putText(annotated, f"Cam {i+1}  tracks: {len(tracks)}", (12, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                cv2.putText(annotated, f"Pallets: {len(pallet_boxes)}", (12, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 120, 0), 2)
 
-            half_width = 960
-            display_height = 1080
-            left_panel = fit_frame(display_frames[0], (half_width, display_height))
-            right_panel = fit_frame(display_frames[1], (half_width, display_height))
-            canvas = np.hstack([left_panel, right_panel])
+                panels.append(annotated)
 
-            status_text = "Awaiting expected qty" if expected_qty is None else ("MATCH" if total_count == expected_qty else "NOT MATCH")
-            status_color = (0, 220, 0) if status_text == "MATCH" else ((0, 0, 255) if status_text == "NOT MATCH" else (255, 255, 255))
+            fusion.update(observations, now)
+            total = fusion.total_count
 
-            cv2.rectangle(canvas, (0, 0), (canvas.shape[1], 120), (0, 0, 0), -1)
-            cv2.putText(canvas, f"FPS: {fps:.1f}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
-            cv2.putText(canvas, f"Total unique boxes: {total_count}", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-            cv2.putText(canvas, f"Expected: {expected_qty if expected_qty is not None else 'unset'}", (520, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
-            cv2.putText(canvas, f"Status: {status_text}", (520, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.9, status_color, 2)
-            cv2.putText(canvas, f"Arduino: {arduino_status}", (980, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0) if arduino_status == "CONNECTED" else (255, 0, 0), 2)
-            cv2.putText(canvas, f"Typing buffer: {expected_input or '_'}  [digits + Enter, Backspace, r=reset, q=quit]", (980, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+            current_status = (total, expected_qty)
+            if current_status != last_status:
+                handle_arduino(arduino, total, expected_qty)
 
-            cv2.imshow(WINDOW_NAME, canvas)
+                log.info(f"Count={total}  Expected={expected_qty}  "f"Status={'MATCH' if expected_qty is not None and total == expected_qty else 'NO MATCH' if expected_qty is not None else 'AWAITING'}")
+                last_status = current_status
+
+            pw, ph = CONFIG["panel_width"], CONFIG["panel_height"]
+            bg = CONFIG["bg_color"]
+            left = fit_frame(panels[0] if len(panels) > 0 else None, pw, ph, bg)
+            right = fit_frame(panels[1] if len(panels) > 1 else None, pw, ph, bg)
+            canvas = np.hstack([left, right])
+
+            draw_hud(canvas, fps, total, expected_qty, typing_buf, arduino is not None and arduino.connected)
+            cv2.imshow(CONFIG["window_name"], canvas)
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 break
-            if ord("0") <= key <= ord("9"):
-                expected_input += chr(key)
+            elif ord("0") <= key <= ord("9"):
+                typing_buf += chr(key)
             elif key in (8, 127):
-                expected_input = expected_input[:-1]
+                typing_buf = typing_buf[:-1]
             elif key in (13, 10):
-                if expected_input:
-                    expected_qty = int(expected_input)
-                    expected_input = ""
-                    print_status(total_count, expected_qty, arduino)
-                    last_status = (total_count, expected_qty)
+                if typing_buf:
+                    expected_qty = int(typing_buf)
+                    typing_buf = ""
+                    
+                    handle_arduino(arduino, total, expected_qty)
+                    last_status = None
             elif key == ord("r"):
-                fusion_counter = GlobalFusionCounter()
-                for tracker in trackers:
-                    tracker.tracks.clear()
-                    tracker.next_track_id = 1
-                total_count = 0
-                expected_input = ""
+                fusion.reset()
+
+                for t in trackers:
+                    t.tracks.clear();  t._next_id = 1
+
+                expected_qty = None
+                typing_buf = ""
+                last_status = None
+
                 if arduino:
-                    arduino.close_gate()  # Reset to closed gate
-                print_status(total_count, expected_qty, arduino)
-                last_status = (total_count, expected_qty)
+                    arduino.idle()
+
+                log.info("Reset: all counts cleared.")
 
     finally:
-        for camera in cameras:
-            camera.release()
+        for cam in cameras:
+            cam.release()
+            
         if arduino:
+            arduino.idle()
             arduino.disconnect()
+
         cv2.destroyAllWindows()
+        log.info("Shutdown complete.")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        log.info("Interrupted by user.")
+    except Exception as e:
+        log.exception(f"Fatal error: {e}")
+        sys.exit(1)

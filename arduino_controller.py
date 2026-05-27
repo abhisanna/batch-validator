@@ -1,191 +1,150 @@
-"""
-Arduino IoT Controller Module
-Manages serial communication with Arduino UNO for gate control and LED feedback
-"""
+import glob
+import platform
+import threading
+import time
+import logging
+import sys
+from dataclasses import dataclass
+from typing import Optional
 
 import serial
-import time
-import threading
-from typing import Optional, Callable
-from dataclasses import dataclass
 
+def setup_logger(name: str = "arduino") -> logging.Logger:
+    logger = logging.getLogger(name)
+
+    if logger.handlers:
+        logger.handlers.clear()
+
+    logger.setLevel(logging.DEBUG)
+
+    fmt = logging.Formatter(
+        "[%(asctime)s] %(levelname)-8s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
+
+    return logger
+
+
+log = setup_logger()
 
 @dataclass
 class ArduinoConfig:
-    """Arduino connection configuration"""
-    port: str = "/dev/cu.usbserial-A5069RR4"  # macOS default, will auto-detect
+    port: str = ""
     baudrate: int = 9600
     timeout: float = 3.0
     retry_attempts: int = 3
     retry_delay: float = 0.5
 
 
-class ArduinoController:
-    """Controls Arduino UNO for gate servo and LED indicators"""
-    
-    def __init__(self, config: Optional[ArduinoConfig] = None, debug: bool = False):
-        """
-        Initialize Arduino controller
-        
-        Args:
-            config: Arduino connection configuration
-            debug: Enable debug logging
-        """
-        self.config = config or ArduinoConfig()
-        self.debug = debug
-        self.serial_port: Optional[serial.Serial] = None
-        self.connected = False
-        self.lock = threading.Lock()
-        self._connect()
-    
-    def _connect(self) -> bool:
-        """Establish serial connection to Arduino"""
-        for attempt in range(self.config.retry_attempts):
-            try:
-                self.serial_port = serial.Serial(
-                    port=self.config.port,
-                    baudrate=self.config.baudrate,
-                    timeout=self.config.timeout
-                )
-                time.sleep(1.0)  # Give Arduino time to initialize after connection
-                
-                # Clear any leftover data
-                self.serial_port.reset_input_buffer()
-                self.serial_port.reset_output_buffer()
-                
-                # Test connection
-                if self._send_command("STATUS"):
-                    self.connected = True
-                    if self.debug:
-                        print(f"✓ Arduino connected on {self.config.port}")
-                    return True
-                    
-            except (serial.SerialException, FileNotFoundError) as e:
-                if self.debug:
-                    print(f"Attempt {attempt + 1}: {e}")
-                if attempt < self.config.retry_attempts - 1:
-                    time.sleep(self.config.retry_delay)
-        
-        if self.debug:
-            print(f"✗ Failed to connect to Arduino on {self.config.port}")
-        return False
-    
-    def _send_command(self, command: str, wait_response: bool = True) -> bool:
-        """
-        Send command to Arduino
-        
-        Args:
-            command: Command to send (e.g., "GATE_OPEN", "GATE_CLOSE")
-            wait_response: Wait for Arduino response
-            
-        Returns:
-            True if successful or no response expected
-        """
-        if not self.serial_port or not self.serial_port.is_open:
-            if self.debug:
-                print("✗ Arduino not connected")
-            return False
-        
-        try:
-            with self.lock:
-                # Send command
-                self.serial_port.write(f"{command}\n".encode('utf-8'))
-                
-                if wait_response:
-                    # Read response
-                    response = self.serial_port.readline().decode('utf-8').strip()
-                    
-                    if self.debug:
-                        print(f"→ Sent: {command}")
-                        print(f"← Received: {response}")
-                    
-                    return response.startswith("OK")
-                else:
-                    if self.debug:
-                        print(f"→ Sent: {command} (no response expected)")
-                    return True
-                    
-        except Exception as e:
-            if self.debug:
-                print(f"✗ Serial error: {e}")
-            self.connected = False
-            return False
-    
-    def open_gate(self) -> bool:
-        """Open the gate and light green LED"""
-        return self._send_command("GATE_OPEN")
-    
-    def close_gate(self) -> bool:
-        """Close the gate and light red LED"""
-        return self._send_command("GATE_CLOSE")
-    
-    def test_connection(self) -> bool:
-        """Test Arduino connection and perform self-test"""
-        return self._send_command("TEST")
-    
-    def get_status(self) -> bool:
-        """Check Arduino status"""
-        return self._send_command("STATUS")
-    
-    def disconnect(self) -> None:
-        """Safely disconnect from Arduino"""
-        try:
-            with self.lock:
-                if self.serial_port and self.serial_port.is_open:
-                    self.serial_port.close()
-                    self.connected = False
-                    if self.debug:
-                        print("✓ Arduino disconnected")
-        except Exception as e:
-            if self.debug:
-                print(f"✗ Disconnect error: {e}")
-    
-    def __del__(self):
-        """Ensure proper cleanup"""
-        self.disconnect()
-
-
 def find_arduino_port() -> Optional[str]:
-    """
-    Auto-detect Arduino serial port
-    Works on macOS, Linux, and Windows
-    
-    Returns:
-        Serial port string or None if not found
-    """
-    import platform
-    import glob
-    
     system = platform.system()
-    
+
     try:
-        if system == "Darwin":  # macOS
-            # Check both /dev/tty.* and /dev/cu.* variants
-            for dev_pattern in ["/dev/cu.*", "/dev/tty.*"]:
-                ports = glob.glob(dev_pattern)
-                for port in ports:
-                    # Look for common Arduino serial patterns
-                    for pattern in ['usbserial', 'usbmodem', 'SLAB_USBtoUART', 'CH34']:
-                        if pattern in port:
-                            return port
-        
+        if system == "Darwin":
+            patterns   = ["/dev/cu.*", "/dev/tty.*"]
+            keywords   = ["usbserial", "usbmodem", "SLAB_USBtoUART", "CH34"]
         elif system == "Linux":
-            ports = glob.glob("/dev/ttyUSB*")
-            if ports:
-                return ports[0]
-        
+            patterns   = ["/dev/ttyUSB*", "/dev/ttyACM*"]
+            keywords   = [""]
         elif system == "Windows":
-            import winreg
-            try:
-                key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, "HARDWARE\\DEVICEMAP\\SERIALCOMM")
-                for i in range(winreg.QueryInfoKey(key)[1]):
-                    name, value, _ = winreg.EnumValue(key, i)
-                    if 'Arduino' in name:
-                        return value
-            except:
-                pass
-    
+            return None
+        else:
+            return None
+
+        for pattern in patterns:
+            for port in glob.glob(pattern):
+                if any(kw in port for kw in keywords):
+                    log.info(f"Auto-detected Arduino port: {port}")
+                    return port
+
     except Exception as e:
-        print(f"Error detecting Arduino port: {e}")
-    
+        log.warning(f"Port auto-detection failed: {e}")
+
     return None
+
+class ArduinoController:
+    def __init__(self, config: Optional[ArduinoConfig] = None):
+        self.config = config or ArduinoConfig()
+        self.port: Optional[serial.Serial] = None
+        self.connected = False
+        self._lock = threading.Lock()
+
+        self._connect()
+
+    def _connect(self) -> None:
+        target_port = self.config.port or find_arduino_port()
+
+        if not target_port:
+            log.warning("No Arduino port found — running without hardware.")
+            return
+
+        for attempt in range(1, self.config.retry_attempts + 1):
+            try:
+                self.port = serial.Serial(
+                    port     = target_port,
+                    baudrate = self.config.baudrate,
+                    timeout  = self.config.timeout,
+                )
+
+                time.sleep(1.5)
+                self.port.reset_input_buffer()
+                self.port.reset_output_buffer()
+
+                if self._send("STATUS"):
+                    self.connected = True
+                    log.info(f"Arduino connected on {target_port}")
+
+                    return
+
+            except (serial.SerialException, FileNotFoundError) as e:
+                log.warning(f"Connection attempt {attempt}/{self.config.retry_attempts}: {e}")
+                time.sleep(self.config.retry_delay)
+
+        log.error(f"Could not connect to Arduino on {target_port}.")
+
+
+    def _send(self, command: str) -> bool:
+        if not self.port or not self.port.is_open:
+            return False
+        try:
+            with self._lock:
+                self.port.write(f"{command}\n".encode("utf-8"))
+                response = self.port.readline().decode("utf-8").strip()
+                log.debug(f"→ {command}  ← {response}")
+
+                return response.startswith("OK")
+        except Exception as e:
+            log.error(f"Serial error on '{command}': {e}")
+            self.connected = False
+
+            return False
+
+    def open_gate(self) -> bool:
+        return self._send("GATE_OPEN")
+
+    def close_gate(self) -> bool:
+        return self._send("GATE_CLOSE")
+
+    def idle(self) -> bool:
+        return self._send("IDLE")
+
+    def status(self) -> bool:
+        return self._send("STATUS")
+
+    def disconnect(self) -> None:
+        try:
+            with self._lock:
+                if self.port and self.port.is_open:
+                    self.port.close()
+            self.connected = False
+            log.info("Arduino disconnected.")
+        except Exception as e:
+            log.warning(f"Disconnect error: {e}")
+
+    def __del__(self):
+        self.disconnect()
