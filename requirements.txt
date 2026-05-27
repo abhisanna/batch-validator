@@ -1,0 +1,6 @@
+ultralytics
+opencv-python
+pyzbar
+pyserial
+matplotlib
+torch>=2.0.0
