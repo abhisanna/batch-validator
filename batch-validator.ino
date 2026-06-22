@@ -21,7 +21,7 @@
 #define PIN_RED   12   // NOTE: never use PIN 0/1 — those are RX/TX (breaks serial)
 
 // ── Servo positions ────────────────────────────────────────────────────────
-#define SERVO_OPEN   90
+#define SERVO_OPEN  -90
 #define SERVO_CLOSED  0
 
 // ── Safety timeout ─────────────────────────────────────────────────────────

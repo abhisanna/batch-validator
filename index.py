@@ -14,7 +14,7 @@ from arduino_controller import ArduinoController, ArduinoConfig, find_arduino_po
 
 CONFIG = {
     "model_path": "./model.pt",
-    "conf_threshold": 0.70, 
+    "conf_threshold": 0.80, 
     "img_size": 640,
     "class_pallet": "pallet",
     "class_box": "box",
@@ -275,7 +275,7 @@ class GlobalFusionCounter:
 
             if gid is None:
                 gid = self._next_id;  self._next_id += 1
-                
+
                 self.objects[gid] = GlobalObject(
                     global_id=gid, camera_name=cam, local_id=lid,
                     bbox=bbox, conf=conf, frame_w=fw, frame_h=fh, last_seen=now,
@@ -289,16 +289,12 @@ class GlobalFusionCounter:
 
             obj = self.objects[gid]
             obj.observations += 1
-
             obj.seen_cameras.add(cam)
             used.add(gid)
 
-            if (not obj.counted
-                    and obj.observations >= self.min_confirmations
-                    and len(obj.seen_cameras) >= self.min_confirmations):
+            if (not obj.counted and obj.observations >= self.min_confirmations):
                 obj.counted = True
-                self.total_count += 1
-                log.info(f"New box counted (global_id={gid}) — total={self.total_count}")
+                log.info(f"Box confirmed (global_id={gid})")
 
             self._local_to_global[(cam, lid)] = gid
 
@@ -309,13 +305,18 @@ class GlobalFusionCounter:
         for key in [k for k, v in self._local_to_global.items() if v not in self.objects]:
             del self._local_to_global[key]
 
+        prev = self.total_count
+        self.total_count = sum(1 for obj in self.objects.values() if obj.counted)
+        if self.total_count != prev:
+            log.info(f"Count changed: {prev} -> {self.total_count}")
+
     def reset(self) -> None:
         self.objects.clear()
         self._local_to_global.clear()
         self.total_count = 0
         self._next_id    = 1
 
-def run_inference(model: YOLO, frame: np.ndarray, device: str, cfg: dict) -> Tuple[List[Tuple[BBox, float]], List[BBox]]:
+def run_inference(model: YOLO, frame: np.ndarray, device: str, cfg: dict) -> Tuple[List[Tuple[BBox, float]], List[BBox], List[Tuple[BBox, float]]]:
     results = model.predict(
         source = frame,
         conf = cfg["conf_threshold"],
@@ -329,7 +330,7 @@ def run_inference(model: YOLO, frame: np.ndarray, device: str, cfg: dict) -> Tup
     raw_boxes: List[Tuple[BBox, float]] = []
 
     if not results or results[0].boxes is None:
-        return [], []
+        return [], [], []
 
     result = results[0]
     names  = result.names
@@ -344,16 +345,16 @@ def run_inference(model: YOLO, frame: np.ndarray, device: str, cfg: dict) -> Tup
         elif cls_name == cfg["class_box"]:
             raw_boxes.append((bbox, conf))
 
-    if not pallet_boxes:
-        return [], []
+    if pallet_boxes:
+        countable_boxes = [
+            (bbox, conf)
+            for bbox, conf in raw_boxes
+            if any(boxes_overlap(bbox, p) for p in pallet_boxes)
+        ]
+    else:
+        countable_boxes = []
 
-    box_detections = [
-        (bbox, conf)
-        for bbox, conf in raw_boxes
-        if any(boxes_overlap(bbox, p) for p in pallet_boxes)
-    ]
-
-    return box_detections, pallet_boxes
+    return raw_boxes, pallet_boxes, countable_boxes
 
 
 def draw_frame(frame: np.ndarray, box_tracks: List[LocalTrack], pallet_boxes: List[BBox], cam_label: str, cfg: dict) -> np.ndarray:
@@ -362,15 +363,15 @@ def draw_frame(frame: np.ndarray, box_tracks: List[LocalTrack], pallet_boxes: Li
     for p in pallet_boxes:
         cv2.rectangle(out, (p[0], p[1]), (p[2], p[3]), (200, 120, 0), 2)
         cv2.putText(out, "pallet", (p[0], max(16, p[1] - 6)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 120, 0), 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (200, 120, 0), 2)
 
     for t in box_tracks:
         x1, y1, x2, y2 = t.bbox
         color = (0, 255, 0) if t.conf >= cfg["conf_threshold"] else (0, 220, 220)
         cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(out, f"{cam_label} #{t.track_id}  {t.conf:.0%}",
+        cv2.putText(out, f"box {t.conf:.0%}",
                     (x1, max(20, y1 - 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
         
     return out
 
@@ -501,9 +502,10 @@ def main() -> None:
 
                     continue
 
-                box_dets, pallet_boxes = run_inference(model, frame, device, CONFIG)
-                tracks = trackers[i].update(box_dets, now)
+                trackable_boxes, pallet_boxes, countable_boxes = run_inference(model, frame, device, CONFIG)
+                tracks = trackers[i].update(trackable_boxes, now)
 
+                countable_ids = {bbox for bbox, _ in countable_boxes}
                 observations.extend({
                     "camera_name": trackers[i].name,
                     "local_id": t.track_id,
@@ -511,7 +513,7 @@ def main() -> None:
                     "conf": t.conf,
                     "frame_w": frame.shape[1],
                     "frame_h": frame.shape[0],
-                } for t in tracks)
+                } for t in tracks if t.bbox in countable_ids)
 
                 annotated = draw_frame(frame, tracks, pallet_boxes, f"Cam {i+1}", CONFIG)
 
