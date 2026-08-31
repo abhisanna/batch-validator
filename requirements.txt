@@ -3,4 +3,8 @@ opencv-python
 pyzbar
 pyserial
 matplotlib
+fastapi
+uvicorn
+pydantic
+requests
 torch>=2.0.0

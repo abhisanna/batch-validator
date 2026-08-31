@@ -8,9 +8,17 @@ yolov8n.pt
 *.mlpackage/
 
 dataset/
+test/
+train/
+valid/
 runs/
 
 .DS_Store
 
 .vscode/
 .idea/
+
+train.log
+
+model-result.png
+data.yaml
